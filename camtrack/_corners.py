@@ -83,19 +83,22 @@ def _to_int_tuple(point):
     return tuple(map(int, np.round(point)))
 
 
-def draw(grayscale_image: np.ndarray, corners: FrameCorners) -> np.ndarray:
+def draw(grayscale_image: np.ndarray, corners: FrameCorners, label: bool = False) -> np.ndarray:
     """
     Draw corners on image.
 
     :param grayscale_image: grayscale float32 image.
     :param corners: corners to draw, pyramid levels must be less than 7.
+    :param label: whether to label each corner with its id
     :return: BGR image with drawn corners.
     """
     bgr = cv2.cvtColor(grayscale_image, cv2.COLOR_GRAY2BGR)
-    for point, block_size in zip(corners.points, corners.sizes):
+    for point, block_size, token in zip(corners.points, corners.sizes, corners.ids):
         point = _to_int_tuple(point)
         radius = int(block_size / 2)
         cv2.circle(bgr, point, radius, (0, 1, 0))
+        if label:
+            cv2.putText(bgr, str(token), point, cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255))
     return bgr
 
 
@@ -229,7 +232,9 @@ def create_cli(build):
     @click.option('file_to_load', '--load-corners', type=click.File('rb'))
     @click.option('file_to_dump', '--dump-corners', type=click.File('wb'))
     @click.option('--show', is_flag=True)
-    def cli(frame_sequence, file_to_load, file_to_dump, show):
+    @click.option('--label', is_flag=True)
+    @click.option('--filter', is_flag=True)
+    def cli(frame_sequence, file_to_load, file_to_dump, show, label, filter):
         """
         FRAME_SEQUENCE path to a video file or shell-like wildcard describing
         multiple images
@@ -239,6 +244,8 @@ def create_cli(build):
             corner_storage = load(file_to_load)
         else:
             corner_storage = build(sequence)
+        if filter:
+            corner_storage = without_short_tracks(corner_storage, 15)
         if file_to_dump is not None:
             dump(corner_storage, file_to_dump)
         if show:
@@ -249,7 +256,7 @@ def create_cli(build):
             frame = 0
             while True:
                 grayscale = sequence[frame]
-                bgr = draw(grayscale, corner_storage[frame])
+                bgr = draw(grayscale, corner_storage[frame], label)
                 cv2.imshow('Frame', bgr)
                 key = chr(cv2.waitKey(20) & 0xFF)
                 if key == 'a' and frame > 0:
