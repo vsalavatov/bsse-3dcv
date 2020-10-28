@@ -37,10 +37,10 @@ class _CornerStorageBuilder:
 def _build_impl(frame_sequence: pims.FramesSequence,
                 builder: _CornerStorageBuilder) -> None:
     h, w = frame_sequence.frame_shape[:2]
-    block_size = round(max(w, h) * 0.012)
+    block_size = round(max(w, h) * 0.009)
     window_size = 3 * block_size
     max_levels = 3
-    max_corners = max(100, min(2000, round(w * h // block_size // block_size)))
+    max_corners = max(300, min(2000, round(w * h / block_size / block_size)))
     quality_level = 0.03
     min_distance = block_size
 

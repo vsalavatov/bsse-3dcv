@@ -233,8 +233,8 @@ def create_cli(build):
     @click.option('file_to_dump', '--dump-corners', type=click.File('wb'))
     @click.option('--show', is_flag=True)
     @click.option('--label', is_flag=True)
-    @click.option('--filter', is_flag=True)
-    def cli(frame_sequence, file_to_load, file_to_dump, show, label, filter):
+    @click.option('--no-filter', is_flag=True)
+    def cli(frame_sequence, file_to_load, file_to_dump, show, label, nofilter):
         """
         FRAME_SEQUENCE path to a video file or shell-like wildcard describing
         multiple images
@@ -244,7 +244,7 @@ def create_cli(build):
             corner_storage = load(file_to_load)
         else:
             corner_storage = build(sequence)
-        if filter:
+        if not nofilter:
             corner_storage = without_short_tracks(corner_storage, 15)
         if file_to_dump is not None:
             dump(corner_storage, file_to_dump)
