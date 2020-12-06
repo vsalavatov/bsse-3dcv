@@ -40,8 +40,8 @@ def _build_impl(frame_sequence: pims.FramesSequence,
     block_size = round(max(w, h) * 0.009)
     window_size = 3 * block_size
     max_levels = 3
-    max_corners = max(300, min(2000, round(w * h / block_size / block_size)))
-    quality_level = 0.03
+    max_corners = max(300, min(2500, round(w * h / block_size / block_size)))
+    quality_level = 0.065
     min_distance = block_size
 
     corners = []
@@ -58,7 +58,7 @@ def _build_impl(frame_sequence: pims.FramesSequence,
         for (x, y), r in zip(corners, radii):
             rx = np.round(x).astype(int)
             ry = np.round(y).astype(int)
-            cv2.circle(mask, (rx, ry), r, thickness=-1, color=0)
+            cv2.circle(mask, (rx, ry), block_size, thickness=-1, color=0)
         return mask
 
     for frame_index, frame in enumerate(frame_sequence):

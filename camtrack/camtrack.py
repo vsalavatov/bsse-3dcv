@@ -7,8 +7,13 @@ __all__ = [
 from typing import List, Optional, Tuple
 
 import numpy as np
+from sklearn.preprocessing import normalize
 
-from corners import CornerStorage
+import sys
+import time
+
+from _corners import StorageFilter
+from corners import CornerStorage, without_short_tracks
 from data3d import CameraParameters, PointCloud, Pose
 import frameseq
 from _camtrack import (
@@ -24,10 +29,165 @@ from _camtrack import (
     rodrigues_and_translation_to_view_mat3x4,
     TriangulationParameters,
     Correspondences,
-    compute_reprojection_errors
-)
+    compute_reprojection_errors,
+    _calc_reprojection_error_mask, _calc_z_mask, _calc_triangulation_angle_mask, to_camera_center)
 import cv2
 from concurrent.futures import ThreadPoolExecutor
+
+CORNER_MIN_FRAMES_COUNT = 12
+CORNER_BORDER_THRESHOLD = 40
+MAX_REPROJECTION_ERROR = 1.65
+MIN_TRIANGULATION_ANGLE_DEG = 2.4
+MIN_DEPTH = 0.001
+RETRIANGULATION_RANSAC_ITERS = 3
+POSES_RECALC_ITERS = 4
+MAX_RETRIANGULATIONS_PER_ITER = 500
+RETRIANGULATION_FRAME_LIMIT = 30
+MIN_COMMON_CORNERS = 11
+ESSENTIAL_RANSAC_THRESHOLD = 1.15
+MAX_VIEWS_CHECK = 2500
+
+retriangulation_params = TriangulationParameters(MAX_REPROJECTION_ERROR, MIN_TRIANGULATION_ANGLE_DEG, MIN_DEPTH)
+
+
+def custom_calc_triangulation_angle_mask(view_mat_1: np.ndarray,
+                                         view_mat_2: np.ndarray,
+                                         points3d: np.ndarray,
+                                         min_angle_deg: float):
+    camera_center_1 = to_camera_center(view_mat_1)
+    camera_center_2 = to_camera_center(view_mat_2)
+    vecs_1 = normalize(camera_center_1 - points3d)
+    vecs_2 = normalize(camera_center_2 - points3d)
+    coss_abs = np.abs(np.einsum('ij,ij->i', vecs_1, vecs_2))
+    angles_mask = coss_abs <= np.cos(np.deg2rad(min_angle_deg))
+    return angles_mask, coss_abs
+
+def custom_triangulate_correspondences(correspondences: Correspondences,
+                                        view_mat_1: np.ndarray, view_mat_2: np.ndarray,
+                                        intrinsic_mat: np.ndarray,
+                                        parameters: TriangulationParameters):
+    points2d_1 = correspondences.points_1
+    points2d_2 = correspondences.points_2
+
+    normalized_points2d_1 = cv2.undistortPoints(
+        points2d_1.reshape(-1, 1, 2),
+        intrinsic_mat,
+        np.array([])
+    ).reshape(-1, 2)
+    normalized_points2d_2 = cv2.undistortPoints(
+        points2d_2.reshape(-1, 1, 2),
+        intrinsic_mat,
+        np.array([])
+    ).reshape(-1, 2)
+
+    points3d = cv2.triangulatePoints(view_mat_1, view_mat_2,
+                                     normalized_points2d_1.T,
+                                     normalized_points2d_2.T)
+    points3d = cv2.convertPointsFromHomogeneous(points3d.T).reshape(-1, 3)
+
+    reproj_errs_1 = compute_reprojection_errors(points3d, points2d_1,
+                                                intrinsic_mat @ view_mat_1)
+    reproj_errs_2 = compute_reprojection_errors(points3d, points2d_2,
+                                                intrinsic_mat @ view_mat_2)
+    reproj_errs = np.max(np.vstack((reproj_errs_1, reproj_errs_2)), axis=0)
+    reproj_error_mask = reproj_errs < parameters.max_reprojection_error
+
+    z_mask = np.logical_and(
+        _calc_z_mask(points3d, view_mat_1, parameters.min_depth),
+        _calc_z_mask(points3d, view_mat_2, parameters.min_depth)
+    )
+
+    angle_mask, cos_angles = custom_calc_triangulation_angle_mask(
+        view_mat_1,
+        view_mat_2,
+        points3d,
+        parameters.min_triangulation_angle_deg
+    )
+    common_mask = reproj_error_mask & z_mask & angle_mask
+    count = np.sum(common_mask)
+    return points3d[common_mask], correspondences.ids[common_mask], \
+           1e9 if count == 0 else np.median(reproj_errs[common_mask]), \
+           0 if count == 0 else np.median(cos_angles[common_mask]), \
+           reproj_errs[common_mask], cos_angles[common_mask]
+
+
+def init_views(rgb_sequence, intrinsic_mat, corner_storage):
+    print('Searching best initial views...')
+    frame_count = len(rgb_sequence)
+    with ThreadPoolExecutor() as executor:
+        tasks = [(i, j) for i in range(frame_count) for j in range(i + 1, frame_count)]
+        torder = np.arange(len(tasks))
+        np.random.shuffle(torder)
+        tasks = np.array(tasks)[torder[:MAX_VIEWS_CHECK]]
+
+        np.seterr(all='raise')
+
+        def try_restore_views(args):
+            np.seterr(all='raise')
+            i, j = args
+            corr = build_correspondences(corner_storage[i], corner_storage[j])
+            if len(corr.ids) < MIN_COMMON_CORNERS:
+                return None
+            essential_mat, essential_mask = cv2.findEssentialMat(corr.points_1, corr.points_2,
+                                                                 intrinsic_mat,
+                                                                 method=cv2.RANSAC, prob=0.999,
+                                                                 threshold=ESSENTIAL_RANSAC_THRESHOLD)
+            essential_mask = essential_mask.ravel() != 0
+            if np.sum(essential_mask) < MIN_COMMON_CORNERS:
+                return None
+            corr = Correspondences(corr.ids[essential_mask],
+                                   corr.points_1[essential_mask],
+                                   corr.points_2[essential_mask])
+            _, R, t, recover_mask = cv2.recoverPose(essential_mat, corr.points_1, corr.points_2, intrinsic_mat)
+            view_mat = np.hstack((R, t))
+            pose = view_mat3x4_to_pose(view_mat)
+            recover_mask = recover_mask.ravel() != 0
+            if np.sum(recover_mask) < MIN_COMMON_CORNERS:
+                return None
+            corr = Correspondences(corr.ids[recover_mask],
+                                   corr.points_1[recover_mask],
+                                   corr.points_2[recover_mask])
+            _, ids, med_reproj_err, med_cos, _, _ = custom_triangulate_correspondences(
+                corr, eye3x4(), view_mat, intrinsic_mat, retriangulation_params
+            )
+            if len(ids) == 0:
+                return None
+            return i, j, pose, len(ids), med_reproj_err, med_cos
+
+        restoration_results = []
+        for (ind, i), r in zip(enumerate(tasks), executor.map(try_restore_views, tasks)):
+            if ind % 18 == 0:
+                print(f'\r{ind / len(tasks)*100:.1f}%', end='')
+                sys.stdout.flush()
+            if r is not None:
+                restoration_results.append(r)
+        print()
+    assert(len(restoration_results) > 0)
+
+    def score(args):
+        _, _, _, inliers, reproj, cos = args
+        return np.log(max(1e-12, 2 * (inliers - MIN_COMMON_CORNERS) / MIN_COMMON_CORNERS)) - 2 * reproj + 7 * (1 - cos**2)
+
+    restoration_results.sort(key=score, reverse=True)
+
+    print(f'Best frames to begin with: {restoration_results[0][0]} {restoration_results[0][1]} '
+          f'(score={score(restoration_results[0]):4f})')
+    return restoration_results[0][:3]
+
+
+def far_from_border(corner_storage: CornerStorage, threshold: int, w, h) -> CornerStorage:
+    max_id = max(corners.ids.max() for corners in corner_storage)
+    isgood = np.ones((max_id + 1,)).astype(bool)
+    for corners in corner_storage:
+        for c, id in zip(corners.points, corners.ids):
+            y, x = c.ravel()
+            if not (threshold <= x <= w - threshold and threshold <= y <= h - threshold):
+                isgood[id[0]] = False
+
+    def predicate(corners):
+        return isgood[corners.ids.flatten()] == True
+
+    return StorageFilter(corner_storage, predicate)
 
 
 def track_and_calc_colors(camera_parameters: CameraParameters,
@@ -36,26 +196,20 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                           known_view_1: Optional[Tuple[int, Pose]] = None,
                           known_view_2: Optional[Tuple[int, Pose]] = None) \
         -> Tuple[List[Pose], PointCloud]:
-    if known_view_1 is None or known_view_2 is None:
-        raise NotImplementedError()
-
-    MAX_REPROJECTION_ERROR = 1.6
-    MIN_TRIANGULATION_ANGLE_DEG = 2.39
-    MIN_DEPTH = 0.1
-    RETRIANGULATION_RANSAC_ITERS = 4
-    POSES_RECALC_ITERS = 4
-    RETRIANGULATE_ITERS = 5
-    MAX_RETRIANGULATES_PER_ITER = 1000
-    RETRIANGULATION_FRAME_LIMIT = 25
-
-    retriangulation_params = TriangulationParameters(MAX_REPROJECTION_ERROR, MIN_TRIANGULATION_ANGLE_DEG, MIN_DEPTH)
+    corner_storage = without_short_tracks(corner_storage, CORNER_MIN_FRAMES_COUNT)
 
     rgb_sequence = frameseq.read_rgb_f32(frame_sequence_path)
+    corner_storage = far_from_border(corner_storage, CORNER_BORDER_THRESHOLD, rgb_sequence.frame_shape[0], rgb_sequence.frame_shape[1])
     intrinsic_mat = to_opencv_camera_mat3x3(
         camera_parameters,
         rgb_sequence[0].shape[0]
     )
     frame_count = len(rgb_sequence)
+
+    if known_view_1 is None or known_view_2 is None:
+        i, j, pose = init_views(rgb_sequence, intrinsic_mat, corner_storage)
+        known_view_1 = (i, view_mat3x4_to_pose(eye3x4()))
+        known_view_2 = (j, pose)
 
     view_mats = [None] * frame_count
     view_mats_inliers = [None] * frame_count
@@ -71,14 +225,14 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                 corner_seen_in_frames[j] = []
             corner_seen_in_frames[j].append((i, idx))
 
-    def populate_cloud(points3d, ids, inliers):
+    def populate_cloud(points3d, ids, score):
         updated_points = 0
-        for i, p, e in zip(ids, points3d, inliers):
-            if i not in cloud3d.keys() or e >= cloud3d[i]['inliers']:
+        for i, p, s in zip(ids, points3d, score):
+            if i not in cloud3d.keys() or s > cloud3d[i]['score']:
                 updated_points += 1
                 cloud3d[i] = {
                     'pos': p,
-                    'inliers': e
+                    'score': s
                 }
         return updated_points
 
@@ -93,7 +247,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
 
     init_p3d, init_ids = triangulate_frame_corrs(known_view_1[0], known_view_2[0])
     print(f'Initializing cloud with {len(init_p3d)} points.')
-    populate_cloud(init_p3d, init_ids, 2 * np.ones_like(init_ids))
+    populate_cloud(init_p3d, init_ids, -100 * np.ones_like(init_ids))
 
     def print_info(msgs=None):
         # print('\033[K', end='\r') # clear line
@@ -142,8 +296,6 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
 
         return R, t, inliers_count
 
-    last_retriangulation = {}
-
     def retriangulate(corner_id):
         frames = []
         p2d = []
@@ -159,14 +311,18 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
             p3d, _ = triangulate_frame_corrs(*frames, params=retriangulation_params)
             if len(p3d) == 0:
                 return None
-            return p3d[0], 2
+            return p3d[0], -100
         if len(frames) > RETRIANGULATION_FRAME_LIMIT:
             order = np.arange(len(frames))
             np.random.shuffle(order)
             order = order[:RETRIANGULATION_FRAME_LIMIT]
             frames, p2d, mats = np.array(frames)[order], np.array(p2d)[order], np.array(mats)[order]
         best_pos = None
-        best_inliers = None
+        best_score = None
+
+        def score(inliers, med_reproj, cos_angle):
+            return np.log(max(1e-4, inliers)) - 3 * med_reproj + 7 * (1 - cos_angle**2)
+
         for _ in range(RETRIANGULATION_RANSAC_ITERS):
             i, j = np.random.choice(len(frames), 2, replace=False)
             p3d, _, _ = triangulate_correspondences(Correspondences(np.zeros(1),
@@ -181,16 +337,21 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                 for f, p2 in zip(frames, p2d)
             ]
             inliers = np.sum(np.array(errs) <= MAX_REPROJECTION_ERROR)
-            if best_pos is None or best_inliers < inliers:
+            _, angle = custom_calc_triangulation_angle_mask(mats[i], mats[j], p3d, 0)
+            angle = angle[0]
+            s = score(inliers, np.median(errs), angle)
+            if best_pos is None or best_score < s:
                 best_pos = p3d[0]
-                best_inliers = inliers
+                best_score = s
         if best_pos is None:
             return None
-        return best_pos, best_inliers
+        return best_pos, best_score
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor() as executor:
         iter_count = 0
+        retriangulation_schedule = dict()
         while np.sum([mat is not None for mat in view_mats]) != frame_count:
+            time_begin = time.time()
             iter_count += 1
             tasks = [i for i in range(frame_count) if view_mats[i] is None]
             restoration_results = []
@@ -217,25 +378,31 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
 
             tasks = [i
                      for i in corner_storage[best_frame].ids.flatten()
-                     if i not in last_retriangulation.keys() or last_retriangulation[
-                         i] <= iter_count - RETRIANGULATE_ITERS]
-            if len(tasks) > MAX_RETRIANGULATES_PER_ITER:
+                     if i not in retriangulation_schedule.keys() or
+                        retriangulation_schedule[i][0] <= iter_count]
+            if len(tasks) > MAX_RETRIANGULATIONS_PER_ITER:
                 np.random.shuffle(tasks)
-                tasks = tasks[:MAX_RETRIANGULATES_PER_ITER]
-            retr_p3d, retr_ids, retr_inliers = [], [], []
+                tasks = tasks[:MAX_RETRIANGULATIONS_PER_ITER]
+            retr_p3d, retr_ids, retr_score = [], [], []
             for i, r in zip(tasks, executor.map(retriangulate, tasks)):
                 if r is not None:
-                    p3, e = r
+                    p3, s = r
                     retr_p3d.append(p3)
                     retr_ids.append(i)
-                    retr_inliers.append(e)
-                last_retriangulation[i] = iter_count
+                    retr_score.append(s)
+                if i not in retriangulation_schedule.keys():
+                    retriangulation_schedule[i] = [iter_count + 1, -2]
+                else:
+                    retriangulation_schedule[i][0] = iter_count + retriangulation_schedule[i][1]
+                    retriangulation_schedule[i][1] += 0.67
 
-            updated_points = populate_cloud(retr_p3d, retr_ids, retr_inliers)
+            updated_points = populate_cloud(retr_p3d, retr_ids, retr_score)
             print_info([f'+pose for frame #{best_frame}',
-                        f'updated {updated_points} points in the cloud'])
+                        f'updated {updated_points} points in the cloud',
+                        f'time elapsed: {time.time() - time_begin:.2f}s'])
 
             if iter_count % POSES_RECALC_ITERS == 0:
+                time_begin = time.time()
                 tasks = [i for i in range(frame_count) if view_mats[i] is not None]
                 updated_poses = 0
                 for i, r in zip(tasks, executor.map(try_restore_pose, tasks)):
@@ -246,7 +413,10 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                             view_mats_inliers[i] = inliers_cnt
                             view_mats[i] = rodrigues_and_translation_to_view_mat3x4(R, t)
                 print_info([f'+pose for frame #{best_frame}',
-                            f'updated {updated_poses} poses'])
+                            f'updated {updated_poses} poses',
+                            f'time elapsed: {time.time() - time_begin:.2f}s'])
+
+            sys.stdout.flush()
 
     ids, points = [], []
     for k, v in cloud3d.items():

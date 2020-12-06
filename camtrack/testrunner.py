@@ -55,10 +55,12 @@ def read_config(config_path):
     config_data = DATASET_CONFIG_SCHEMA(raw_config_data)
     config = dict()
     for name, info in config_data['tests'].items():
-        config[name] = TestInfo(**{
+        tmp = {'initial_frames': None}
+        tmp.update({
             k: path.join(root, v) if isinstance(v, str) else v
             for k, v in info.items()
         })
+        config[name] = TestInfo(**tmp)
     return config
 
 
