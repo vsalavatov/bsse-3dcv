@@ -176,7 +176,7 @@ def init_views(rgb_sequence, intrinsic_mat, corner_storage):
 
     def score(args):
         _, _, _, inliers, reproj, cos, h_score = args
-        return h_score**3 * (np.sqrt(2 * (inliers - MIN_COMMON_CORNERS) / MIN_COMMON_CORNERS) - 3 * reproj + 10 * (1 - cos**2))
+        return h_score**3.0 * (np.sqrt(inliers / MIN_COMMON_CORNERS) - 3 * reproj + 10 * (1 - cos**2))
 
     restoration_results.sort(key=score, reverse=True)
 
@@ -437,6 +437,12 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         points.append(v['pos'])
     point_cloud_builder = PointCloudBuilder(np.array(ids),
                                             np.array(points))
+
+    prev_known_view = view_mats[known_view_1[0]]
+    for i in range(len(view_mats)):
+        if view_mats[i] is None:
+            view_mats[i] = prev_known_view
+        prev_known_view = view_mats[i]
 
     calc_point_cloud_colors(
         point_cloud_builder,
