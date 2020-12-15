@@ -62,6 +62,7 @@ def custom_calc_triangulation_angle_mask(view_mat_1: np.ndarray,
     angles_mask = coss_abs <= np.cos(np.deg2rad(min_angle_deg))
     return angles_mask, coss_abs
 
+
 def custom_triangulate_correspondences(correspondences: Correspondences,
                                         view_mat_1: np.ndarray, view_mat_2: np.ndarray,
                                         intrinsic_mat: np.ndarray,
@@ -120,10 +121,7 @@ def init_views(rgb_sequence, intrinsic_mat, corner_storage):
         np.random.shuffle(torder)
         tasks = np.array(tasks)[torder[:MAX_VIEWS_CHECK]]
 
-        np.seterr(all='raise')
-
         def try_restore_views(args):
-            np.seterr(all='raise')
             i, j = args
             corr = build_correspondences(corner_storage[i], corner_storage[j])
             if len(corr.ids) < MIN_COMMON_CORNERS:
@@ -132,12 +130,24 @@ def init_views(rgb_sequence, intrinsic_mat, corner_storage):
                                                                  intrinsic_mat,
                                                                  method=cv2.RANSAC, prob=0.999,
                                                                  threshold=ESSENTIAL_RANSAC_THRESHOLD)
+            if essential_mat is None:
+                return None
             essential_mask = essential_mask.ravel() != 0
             if np.sum(essential_mask) < MIN_COMMON_CORNERS:
                 return None
+
             corr = Correspondences(corr.ids[essential_mask],
                                    corr.points_1[essential_mask],
                                    corr.points_2[essential_mask])
+
+            _, homography_mask = cv2.findHomography(corr.points_1,
+                                               corr.points_2,
+                                               method=cv2.RANSAC,
+                                               ransacReprojThreshold=ESSENTIAL_RANSAC_THRESHOLD,
+                                               confidence=0.999,
+                                               maxIters=2390)
+            h_score = 1.0 - np.sum(homography_mask != 0) / corr.ids.shape[0]
+
             _, R, t, recover_mask = cv2.recoverPose(essential_mat, corr.points_1, corr.points_2, intrinsic_mat)
             view_mat = np.hstack((R, t))
             pose = view_mat3x4_to_pose(view_mat)
@@ -152,7 +162,7 @@ def init_views(rgb_sequence, intrinsic_mat, corner_storage):
             )
             if len(ids) == 0:
                 return None
-            return i, j, pose, len(ids), med_reproj_err, med_cos
+            return i, j, pose, len(ids), med_reproj_err, med_cos, h_score
 
         restoration_results = []
         for (ind, i), r in zip(enumerate(tasks), executor.map(try_restore_views, tasks)):
@@ -165,8 +175,8 @@ def init_views(rgb_sequence, intrinsic_mat, corner_storage):
     assert(len(restoration_results) > 0)
 
     def score(args):
-        _, _, _, inliers, reproj, cos = args
-        return np.log(max(1e-12, 2 * (inliers - MIN_COMMON_CORNERS) / MIN_COMMON_CORNERS)) - 2 * reproj + 7 * (1 - cos**2)
+        _, _, _, inliers, reproj, cos, h_score = args
+        return h_score**3 * (np.sqrt(2 * (inliers - MIN_COMMON_CORNERS) / MIN_COMMON_CORNERS) - 3 * reproj + 10 * (1 - cos**2))
 
     restoration_results.sort(key=score, reverse=True)
 
@@ -347,76 +357,79 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
             return None
         return best_pos, best_score
 
-    with ThreadPoolExecutor() as executor:
-        iter_count = 0
-        retriangulation_schedule = dict()
-        while np.sum([mat is not None for mat in view_mats]) != frame_count:
-            time_begin = time.time()
-            iter_count += 1
-            tasks = [i for i in range(frame_count) if view_mats[i] is None]
-            restoration_results = []
-
-            for i, r in zip(tasks, executor.map(try_restore_pose, tasks)):
-                if r is not None:
-                    restoration_results.append((i, r))
-
-            if len(restoration_results) == 0:
-                print('Cannot restore any more camera poses!')
-                break
-            best_frame = None
-            best_restoration_result = None
-            for i, r in restoration_results:
-                if best_restoration_result is None or best_restoration_result[2] < r[2]:  # compare number of inliers
-                    best_restoration_result = r
-                    best_frame = i
-
-            print_info([f'+pose for frame #{best_frame}',
-                        f'inliers count: {best_restoration_result[2]}'])
-
-            view_mats[best_frame] = rodrigues_and_translation_to_view_mat3x4(*best_restoration_result[:2])
-            view_mats_inliers[best_frame] = best_restoration_result[2]
-
-            tasks = [i
-                     for i in corner_storage[best_frame].ids.flatten()
-                     if i not in retriangulation_schedule.keys() or
-                        retriangulation_schedule[i][0] <= iter_count]
-            if len(tasks) > MAX_RETRIANGULATIONS_PER_ITER:
-                np.random.shuffle(tasks)
-                tasks = tasks[:MAX_RETRIANGULATIONS_PER_ITER]
-            retr_p3d, retr_ids, retr_score = [], [], []
-            for i, r in zip(tasks, executor.map(retriangulate, tasks)):
-                if r is not None:
-                    p3, s = r
-                    retr_p3d.append(p3)
-                    retr_ids.append(i)
-                    retr_score.append(s)
-                if i not in retriangulation_schedule.keys():
-                    retriangulation_schedule[i] = [iter_count + 1, -2]
-                else:
-                    retriangulation_schedule[i][0] = iter_count + retriangulation_schedule[i][1]
-                    retriangulation_schedule[i][1] += 0.67
-
-            updated_points = populate_cloud(retr_p3d, retr_ids, retr_score)
-            print_info([f'+pose for frame #{best_frame}',
-                        f'updated {updated_points} points in the cloud',
-                        f'time elapsed: {time.time() - time_begin:.2f}s'])
-
-            if iter_count % POSES_RECALC_ITERS == 0:
+    try:
+        with ThreadPoolExecutor() as executor:
+            iter_count = 0
+            retriangulation_schedule = dict()
+            while np.sum([mat is not None for mat in view_mats]) != frame_count:
                 time_begin = time.time()
-                tasks = [i for i in range(frame_count) if view_mats[i] is not None]
-                updated_poses = 0
+                iter_count += 1
+                tasks = [i for i in range(frame_count) if view_mats[i] is None]
+                restoration_results = []
+
                 for i, r in zip(tasks, executor.map(try_restore_pose, tasks)):
                     if r is not None:
-                        R, t, inliers_cnt = r
-                        if inliers_cnt >= view_mats_inliers[i]:
-                            updated_poses += 1
-                            view_mats_inliers[i] = inliers_cnt
-                            view_mats[i] = rodrigues_and_translation_to_view_mat3x4(R, t)
+                        restoration_results.append((i, r))
+
+                if len(restoration_results) == 0:
+                    print('Cannot restore any more camera poses!')
+                    break
+                best_frame = None
+                best_restoration_result = None
+                for i, r in restoration_results:
+                    if best_restoration_result is None or best_restoration_result[2] < r[2]:  # compare number of inliers
+                        best_restoration_result = r
+                        best_frame = i
+
                 print_info([f'+pose for frame #{best_frame}',
-                            f'updated {updated_poses} poses',
+                            f'inliers count: {best_restoration_result[2]}'])
+
+                view_mats[best_frame] = rodrigues_and_translation_to_view_mat3x4(*best_restoration_result[:2])
+                view_mats_inliers[best_frame] = best_restoration_result[2]
+
+                tasks = [i
+                         for i in corner_storage[best_frame].ids.flatten()
+                         if i not in retriangulation_schedule.keys() or
+                            retriangulation_schedule[i][0] <= iter_count]
+                if len(tasks) > MAX_RETRIANGULATIONS_PER_ITER:
+                    np.random.shuffle(tasks)
+                    tasks = tasks[:MAX_RETRIANGULATIONS_PER_ITER]
+                retr_p3d, retr_ids, retr_score = [], [], []
+                for i, r in zip(tasks, executor.map(retriangulate, tasks)):
+                    if r is not None:
+                        p3, s = r
+                        retr_p3d.append(p3)
+                        retr_ids.append(i)
+                        retr_score.append(s)
+                    if i not in retriangulation_schedule.keys():
+                        retriangulation_schedule[i] = [iter_count + 1, -2]
+                    else:
+                        retriangulation_schedule[i][0] = iter_count + retriangulation_schedule[i][1]
+                        retriangulation_schedule[i][1] += 0.67
+
+                updated_points = populate_cloud(retr_p3d, retr_ids, retr_score)
+                print_info([f'+pose for frame #{best_frame}',
+                            f'updated {updated_points} points in the cloud',
                             f'time elapsed: {time.time() - time_begin:.2f}s'])
 
-            sys.stdout.flush()
+                if iter_count % POSES_RECALC_ITERS == 0:
+                    time_begin = time.time()
+                    tasks = [i for i in range(frame_count) if view_mats[i] is not None]
+                    updated_poses = 0
+                    for i, r in zip(tasks, executor.map(try_restore_pose, tasks)):
+                        if r is not None:
+                            R, t, inliers_cnt = r
+                            if inliers_cnt >= view_mats_inliers[i]:
+                                updated_poses += 1
+                                view_mats_inliers[i] = inliers_cnt
+                                view_mats[i] = rodrigues_and_translation_to_view_mat3x4(R, t)
+                    print_info([f'+pose for frame #{best_frame}',
+                                f'updated {updated_poses} poses',
+                                f'time elapsed: {time.time() - time_begin:.2f}s'])
+
+                sys.stdout.flush()
+    except: # couldn't restore all poses
+        pass
 
     ids, points = [], []
     for k, v in cloud3d.items():
