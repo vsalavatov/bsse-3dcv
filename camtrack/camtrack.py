@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 CORNER_MIN_FRAMES_COUNT = 12
 CORNER_BORDER_THRESHOLD = 40
 MAX_REPROJECTION_ERROR = 1.65
-MIN_TRIANGULATION_ANGLE_DEG = 2.4
+MIN_TRIANGULATION_ANGLE_DEG = 2.39
 MIN_DEPTH = 0.001
 RETRIANGULATION_RANSAC_ITERS = 3
 POSES_RECALC_ITERS = 4
@@ -176,7 +176,7 @@ def init_views(rgb_sequence, intrinsic_mat, corner_storage):
 
     def score(args):
         _, _, _, inliers, reproj, cos, h_score = args
-        return h_score**3.0 * (np.sqrt(inliers / MIN_COMMON_CORNERS) - 3 * reproj + 10 * (1 - cos**2))
+        return h_score**3.0 * (np.power(inliers / MIN_COMMON_CORNERS, 0.4) - 6 * reproj + 10 * (1 - cos**2))
 
     restoration_results.sort(key=score, reverse=True)
 
