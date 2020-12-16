@@ -36,15 +36,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 CORNER_MIN_FRAMES_COUNT = 12
 CORNER_BORDER_THRESHOLD = 40
-MAX_REPROJECTION_ERROR = 1.65
+MAX_REPROJECTION_ERROR = 1.8
 MIN_TRIANGULATION_ANGLE_DEG = 2.39
 MIN_DEPTH = 0.001
-RETRIANGULATION_RANSAC_ITERS = 3
-POSES_RECALC_ITERS = 4
-MAX_RETRIANGULATIONS_PER_ITER = 500
-RETRIANGULATION_FRAME_LIMIT = 30
-MIN_COMMON_CORNERS = 11
-ESSENTIAL_RANSAC_THRESHOLD = 1.15
+RETRIANGULATION_RANSAC_ITERS = 4
+POSES_RECALC_ITERS = 3
+MAX_RETRIANGULATIONS_PER_ITER = 100
+RESTORATION_INLIERS_THRESHOLD = 0.9
+RETRIANGULATION_FRAME_LIMIT = 36
+MIN_COMMON_CORNERS = 15
+ESSENTIAL_RANSAC_THRESHOLD = 1.5
 MAX_VIEWS_CHECK = 2500
 
 retriangulation_params = TriangulationParameters(MAX_REPROJECTION_ERROR, MIN_TRIANGULATION_ANGLE_DEG, MIN_DEPTH)
@@ -176,7 +177,7 @@ def init_views(rgb_sequence, intrinsic_mat, corner_storage):
 
     def score(args):
         _, _, _, inliers, reproj, cos, h_score = args
-        return h_score**3.0 * (np.power(inliers / MIN_COMMON_CORNERS, 0.4) - 6 * reproj + 10 * (1 - cos**2))
+        return h_score**3.0 * (np.power(inliers / MIN_COMMON_CORNERS, 0.4) - 6 * reproj + 5 * (1 - cos**2))
 
     restoration_results.sort(key=score, reverse=True)
 
@@ -331,7 +332,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         best_score = None
 
         def score(inliers, med_reproj, cos_angle):
-            return np.log(max(1e-4, inliers)) - 3 * med_reproj + 7 * (1 - cos_angle**2)
+            return np.power(inliers, 0.4) - 7 * med_reproj + 5 * (1 - cos_angle**2)
 
         for _ in range(RETRIANGULATION_RANSAC_ITERS):
             i, j = np.random.choice(len(frames), 2, replace=False)
@@ -374,26 +375,38 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                 if len(restoration_results) == 0:
                     print('Cannot restore any more camera poses!')
                     break
-                best_frame = None
-                best_restoration_result = None
+
+                restoration_results.sort(key=lambda x: x[1][2], reverse=True)
+                best_frames = []
+                best_restoration_results = []
+                inliers_target = restoration_results[0][1][2]
                 for i, r in restoration_results:
-                    if best_restoration_result is None or best_restoration_result[2] < r[2]:  # compare number of inliers
-                        best_restoration_result = r
-                        best_frame = i
+                    if r[2] >= inliers_target * RESTORATION_INLIERS_THRESHOLD:  # compare number of inliers
+                        best_restoration_results.append(r)
+                        best_frames.append(i)
+                    else:
+                        break
 
-                print_info([f'+pose for frame #{best_frame}',
-                            f'inliers count: {best_restoration_result[2]}'])
+                for best_frame, best_restoration_result in zip(best_frames, best_restoration_results):
+                    print_info([f'+pose for frame #{best_frame}',
+                                f'inliers count: {best_restoration_result[2]}'])
 
-                view_mats[best_frame] = rodrigues_and_translation_to_view_mat3x4(*best_restoration_result[:2])
-                view_mats_inliers[best_frame] = best_restoration_result[2]
+                    view_mats[best_frame] = rodrigues_and_translation_to_view_mat3x4(*best_restoration_result[:2])
+                    view_mats_inliers[best_frame] = best_restoration_result[2]
 
-                tasks = [i
+                tasks = np.unique([i
+                         for best_frame in best_frames
                          for i in corner_storage[best_frame].ids.flatten()
-                         if i not in retriangulation_schedule.keys() or
-                            retriangulation_schedule[i][0] <= iter_count]
+                         if i in retriangulation_schedule.keys() and
+                            retriangulation_schedule[i][0] <= iter_count]).tolist()
                 if len(tasks) > MAX_RETRIANGULATIONS_PER_ITER:
                     np.random.shuffle(tasks)
                     tasks = tasks[:MAX_RETRIANGULATIONS_PER_ITER]
+                tasks += np.unique([i
+                                   for best_frame in best_frames
+                                   for i in corner_storage[best_frame].ids.flatten()
+                                   if i not in retriangulation_schedule.keys()
+                                   ]).tolist()
                 retr_p3d, retr_ids, retr_score = [], [], []
                 for i, r in zip(tasks, executor.map(retriangulate, tasks)):
                     if r is not None:
@@ -405,7 +418,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                         retriangulation_schedule[i] = [iter_count + 1, -2]
                     else:
                         retriangulation_schedule[i][0] = iter_count + retriangulation_schedule[i][1]
-                        retriangulation_schedule[i][1] += 0.67
+                        retriangulation_schedule[i][1] += 1
 
                 updated_points = populate_cloud(retr_p3d, retr_ids, retr_score)
                 print_info([f'+pose for frame #{best_frame}',
@@ -428,8 +441,8 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                                 f'time elapsed: {time.time() - time_begin:.2f}s'])
 
                 sys.stdout.flush()
-    except: # couldn't restore all poses
-        pass
+    except Exception as e: # couldn't restore all poses
+        print(e)
 
     ids, points = [], []
     for k, v in cloud3d.items():
